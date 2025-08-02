@@ -1055,22 +1055,22 @@ enum PreflightCacheValue {
 #[allow(clippy::vec_box)]
 fn handle_lock_event(
     request_id: U256,
-    active_tasks: &mut BTreeMap<U256, BTreeMap<String, CancellationToken>>,
+    active_tasks: &mut BTreeMap<U256, BTreeMap<String, (FulfillmentType, CancellationToken)>>,
     pending_orders: &mut Vec<Box<OrderRequest>>,
 ) {
     // Cancel only LockAndFulfill active tasks
     if let Some(order_tasks) = active_tasks.get_mut(&request_id) {
         let initial_count = order_tasks.len();
-        order_tasks.retain(|order_id, task_token| {
-            if !order_id.contains("Primary") {
-                task_token.cancel();
-                false
-            } else {
-                true
-            }
-        });
-        let cancelled = initial_count - order_tasks.len();
 
+        order_tasks.retain(|_, (fulfillment_type, task_token)| {
+            let is_primary = *fulfillment_type == FulfillmentType::Primary;
+            if !is_primary {
+                task_token.cancel();
+            }
+            is_primary
+        });
+
+        let cancelled = initial_count - order_tasks.len();
         if cancelled > 0 {
             tracing::debug!(
                 "Cancelled {} LockAndFulfill preflights for locked request 0x{:x}",
@@ -1079,10 +1079,27 @@ fn handle_lock_event(
             );
         }
 
-        // Remove the entry if no tasks remain
         if order_tasks.is_empty() {
             active_tasks.remove(&request_id);
         }
+    }
+
+    // Remove only pending LockAndFulfill orders
+    let initial_len = pending_orders.len();
+    pending_orders.retain(|order| {
+        let same_request = U256::from(order.request.id) == request_id;
+        let is_primary = order.fulfillment_type == FulfillmentType::Primary;
+        !(same_request && is_primary)
+    });
+
+    let removed_orders = initial_len - pending_orders.len();
+    if removed_orders > 0 {
+        tracing::debug!(
+            "Removed {} pending LockAndFulfill orders for locked request 0x{:x}",
+            removed_orders,
+            request_id
+        );
+    }
     }
 
     // Remove only pending LockAndFulfill orders
