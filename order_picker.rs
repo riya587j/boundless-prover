@@ -1062,7 +1062,7 @@ fn handle_lock_event(
     if let Some(order_tasks) = active_tasks.get_mut(&request_id) {
         let initial_count = order_tasks.len();
         order_tasks.retain(|order_id, task_token| {
-            if order_id.contains("LockAndFulfill") {
+            if !order_id.contains("Primary") {
                 task_token.cancel();
                 false
             } else {
@@ -2586,7 +2586,7 @@ pub(crate) mod tests {
         let remaining_tasks = active_tasks.get(&request_id).unwrap();
         assert_eq!(remaining_tasks.len(), 1);
         let remaining_order_id = remaining_tasks.keys().next().unwrap();
-        assert!(remaining_order_id.contains("FulfillAfterLockExpire"));
+        assert!(remaining_order_id.contains("Primary"));
 
         assert_eq!(pending_orders.len(), 1);
         assert_eq!(pending_orders[0].fulfillment_type, FulfillmentType::Primary);
