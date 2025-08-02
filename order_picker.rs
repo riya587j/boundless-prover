@@ -212,6 +212,14 @@ where
         cancel_token: CancellationToken,
     ) -> bool {
         let order_id = order.id();
+        if order.fulfillment_type != FulfillmentType::Primary {
+    tracing::info!("Skipping secondary order: {:?}", order_id);
+    // Add skipped order to database
+    if let Err(e) = self.db.insert_skipped_request(&order).await {
+        tracing::error!("Failed to record skipped secondary order: {e}");
+    }
+    return false; 
+}
         let f = || async {
             let pricing_result = tokio::select! {
                 result = self.price_order(&mut order) => result,
@@ -299,12 +307,15 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::debug!("Pricing order {order_id}");
-
+          if order.fulfillment_type != FulfillmentType::Primary {
+        tracing::info!("Skipping secondary order in price_order: {order_id}");
+        return Ok(Skip);
+    }
         let now = now_timestamp();
 
         // If order_expiration > lock_expiration the period in-between is when order can be filled
         // by anyone without staking to partially claim the slashed stake
-        let lock_expired = order.fulfillment_type == FulfillmentType::FulfillAfterLockExpire;
+        let lock_expired = order.fulfillment_type == FulfillmentType::Primary;
 
         let expiration = order.expiry();
         let lockin_stake =
@@ -371,7 +382,7 @@ where
         }
 
         // Short circuit if the order has been locked.
-        if order.fulfillment_type == FulfillmentType::LockAndFulfill
+        if order.fulfillment_type == FulfillmentType::Primary
             && self
                 .db
                 .is_request_locked(U256::from(order.request.id))
@@ -382,7 +393,7 @@ where
             return Ok(Skip);
         }
 
-        if order.fulfillment_type == FulfillmentType::FulfillAfterLockExpire
+        if order.fulfillment_type == FulfillmentType::Primary
             && self
                 .db
                 .is_request_fulfilled(U256::from(order.request.id))
@@ -671,6 +682,10 @@ where
         order_gas_cost: U256,
         lock_expired: bool,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
+         if order.fulfillment_type != FulfillmentType::Primary {
+        tracing::debug!("Skipping non-primary order {}", order.id());
+        return Ok(Skip);
+    }
         if lock_expired {
             return self.evaluate_lock_expired_order(order, proof_res).await;
         } else {
@@ -861,10 +876,15 @@ where
         order: &OrderRequest,
         order_gas_cost: U256,
     ) -> Result<(u64, u64), OrderPickerErr> {
-        // Derive parameters from order
+        if order.fulfillment_type != FulfillmentType::Primary {
+        tracing::debug!("Skipping non-primary order {}", order.id());
+        return Err(OrderPickerErr::UnexpectedErr(Arc::new(anyhow::anyhow!(
+            "Non-primary order in calculate_exec_limits"
+        ))));
+    }
+        // Always treat as primary order
         let order_id = order.id();
-        let is_fulfill_after_lock_expire =
-            order.fulfillment_type == FulfillmentType::FulfillAfterLockExpire;
+        let is_fulfill_after_lock_expire = false; // force disable secondary prove mode
         let now = now_timestamp();
         let request_expiration = order.expiry();
         let lock_expiry = order.request.lock_expires_at();
@@ -1069,7 +1089,7 @@ fn handle_lock_event(
     let initial_len = pending_orders.len();
     pending_orders.retain(|order| {
         let same_request = U256::from(order.request.id) == request_id;
-        let is_lock_and_fulfill = order.fulfillment_type == FulfillmentType::LockAndFulfill;
+        let is_lock_and_fulfill = order.fulfillment_type == FulfillmentType::Primary;
         !(same_request && is_lock_and_fulfill)
     });
     let removed_orders = initial_len - pending_orders.len();
@@ -1380,7 +1400,7 @@ pub(crate) mod tests {
                 min_price: parse_ether("0.02").unwrap(),
                 max_price: parse_ether("0.04").unwrap(),
                 lock_stake: U256::ZERO,
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 bidding_start: now_timestamp(),
                 lock_timeout: 900,
                 timeout: 1200,
@@ -2119,7 +2139,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 bidding_start: now_timestamp(),
                 lock_timeout: 1000,
                 timeout: 10000,
@@ -2161,7 +2181,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 bidding_start: now_timestamp(),
                 lock_timeout: 0,
                 timeout: 10000,
@@ -2330,7 +2350,7 @@ pub(crate) mod tests {
         let mut order = ctx
             .generate_next_order(OrderParams {
                 lock_stake: U256::from(1),
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 bidding_start: now_timestamp() - 100,
                 lock_timeout: 10,
                 timeout: 300,
@@ -2353,7 +2373,7 @@ pub(crate) mod tests {
             .generate_next_order(OrderParams {
                 order_index: 2,
                 lock_stake: U256::from(40),
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 bidding_start: now_timestamp() - 100,
                 lock_timeout: 10,
                 timeout: 300,
@@ -2455,7 +2475,7 @@ pub(crate) mod tests {
 
         let mut order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 ..Default::default()
             })
             .await;
@@ -2527,7 +2547,7 @@ pub(crate) mod tests {
         let lock_and_fulfill_order = ctx
             .generate_next_order(OrderParams {
                 order_index: 123,
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 ..Default::default()
             })
             .await;
@@ -2535,7 +2555,7 @@ pub(crate) mod tests {
         let fulfill_after_expire_order = ctx
             .generate_next_order(OrderParams {
                 order_index: 123,
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 ..Default::default()
             })
             .await;
@@ -2569,7 +2589,7 @@ pub(crate) mod tests {
         assert!(remaining_order_id.contains("FulfillAfterLockExpire"));
 
         assert_eq!(pending_orders.len(), 1);
-        assert_eq!(pending_orders[0].fulfillment_type, FulfillmentType::FulfillAfterLockExpire);
+        assert_eq!(pending_orders[0].fulfillment_type, FulfillmentType::Primary);
     }
 
     #[tokio::test]
@@ -2590,7 +2610,7 @@ pub(crate) mod tests {
         let fulfill_after_expire_order = ctx
             .generate_next_order(OrderParams {
                 order_index: 456,
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 ..Default::default()
             })
             .await;
@@ -2731,7 +2751,7 @@ pub(crate) mod tests {
         let mut order3 = ctx
             .generate_next_order(OrderParams {
                 order_index: 100,
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 ..Default::default()
             })
             .await;
@@ -2976,7 +2996,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("0.05").unwrap(), // 0.05 ETH max price
                 lock_stake: parse_stake_tokens("100"),   // 100 stake tokens
                 lock_timeout: 900,                       // lock timeout
@@ -3022,7 +3042,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("0.05").unwrap(), // 0.05 ETH max price
                 lock_stake: parse_stake_tokens("1000"),  // 1000 stake tokens
                 lock_timeout: 900,
@@ -3077,7 +3097,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("1.0").unwrap(), // Won't be used
                 lock_stake: parse_stake_tokens("100"),  // 100 stake tokens
                 lock_timeout: 900,
@@ -3127,7 +3147,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("10.0").unwrap(), // Very high price
                 lock_stake: parse_stake_tokens("1000.0"), // Very high stake
                 lock_timeout: 900,
@@ -3171,7 +3191,7 @@ pub(crate) mod tests {
 
         let mut order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("1.0").unwrap(),
                 lock_stake: parse_stake_tokens("100.0"),
                 lock_timeout: 900,
@@ -3216,7 +3236,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("10.0").unwrap(), // High price that would normally allow many cycles
                 lock_stake: parse_stake_tokens("100.0"), // High stake
                 lock_timeout: 60,                        // 60 second lock timeout
@@ -3261,7 +3281,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("1.0").unwrap(),
                 lock_stake: parse_stake_tokens("10.0"),
                 lock_timeout: 900,
@@ -3302,7 +3322,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("1.0").unwrap(), // High price
                 lock_stake: parse_stake_tokens("10.0"), // High stake
                 lock_timeout: 1,                        // 1 second lock timeout (very short!)
@@ -3345,7 +3365,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 max_price: parse_ether("1.0").unwrap(),
                 lock_stake: parse_stake_tokens("10.0"),
                 lock_timeout: 60,
@@ -3394,7 +3414,7 @@ pub(crate) mod tests {
 
         let order = ctx
             .generate_next_order(OrderParams {
-                fulfillment_type: FulfillmentType::FulfillAfterLockExpire,
+                fulfillment_type: FulfillmentType::Primary,
                 ..Default::default()
             })
             .await;
