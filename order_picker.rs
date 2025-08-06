@@ -299,7 +299,11 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::debug!("Pricing order {order_id}");
-
+        
+      if order.fulfillment_type != FulfillmentType::Primary {
+    tracing::info!("Skipping non-primary order {order_id}");
+    return Ok(Skip);
+}
         let now = now_timestamp();
 
         // If order_expiration > lock_expiration the period in-between is when order can be filled
@@ -1158,9 +1162,16 @@ where
                     // This channel is cancellation safe, so it's fine to use in the select!
                     Some(order) = rx.recv() => {
                         let order_id = order.id();
+                         if order.fulfillment_type != FulfillmentType::Primary {
+        tracing::info!(
+            "Skipping non-primary order {} before queuing for pricing",
+            order_id
+        );
+        continue;
+    }
                         pending_orders.push(order);
                         tracing::debug!(
-                            "Queued order {} to be priced. Currently {} queued pricing tasks: {}",
+                            "Queued order primary {} to be priced. Currently {} queued pricing tasks: {}",
                             order_id,
                             pending_orders.len(),
                             pending_orders
@@ -1380,7 +1391,7 @@ pub(crate) mod tests {
                 min_price: parse_ether("0.02").unwrap(),
                 max_price: parse_ether("0.04").unwrap(),
                 lock_stake: U256::ZERO,
-                fulfillment_type: FulfillmentType::LockAndFulfill,
+                fulfillment_type: FulfillmentType::Primary,
                 bidding_start: now_timestamp(),
                 lock_timeout: 900,
                 timeout: 1200,
@@ -1887,30 +1898,55 @@ pub(crate) mod tests {
         assert!(logs_contain(&format!("Estimated gas cost to lock and fulfill order {order_id}:")));
     }
 
-    #[tokio::test]
-    #[traced_test]
-    async fn skip_unallowed_addr() {
-        let config = ConfigLock::default();
-        {
-            config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
-            config.load_write().unwrap().market.allow_client_addresses = Some(vec![Address::ZERO]);
-        }
-        let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
-
-        let order = ctx.generate_next_order(Default::default()).await;
-
-        let _request_id =
-            ctx.boundless_market.submit_request(&order.request, &ctx.signer(0)).await.unwrap();
-
-        let order_id = order.id();
-        let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
-        assert!(!locked);
-
-        let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(db_order.status, OrderStatus::Skipped);
-
-        assert!(logs_contain("because it is not in allowed addrs"));
+   #[tokio::test]
+#[traced_test]
+async fn skip_unallowed_addr() {
+    let config = ConfigLock::default();
+    {
+        config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
+        config.load_write().unwrap().market.allow_client_addresses = Some(vec![Address::ZERO]);
     }
+    let ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+
+    let order = ctx.generate_next_order(Default::default()).await;
+
+    let _request_id =
+        ctx.boundless_market.submit_request(&order.request, &ctx.signer(0)).await.unwrap();
+
+    let order_id = order.id();
+    let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
+    assert!(!locked);
+
+    let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
+    assert_eq!(db_order.status, OrderStatus::Skipped);
+
+    assert!(logs_contain("because it is not in allowed addrs"));
+}
+
+#[tokio::test]
+#[traced_test]
+async fn skip_non_primary_order() {
+    let config = ConfigLock::default();
+    {
+        config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
+    }
+    let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
+
+    // Create an order with a non-primary fulfillment type
+    let order = ctx.generate_next_order(OrderParams {
+        fulfillment_type: FulfillmentType::LockAndFulfill, // Not Primary
+        ..Default::default()
+    }).await;
+
+    let order_id = order.id();
+    let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
+    assert!(!locked);
+
+    let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
+    assert_eq!(db_order.status, OrderStatus::Skipped);
+
+    assert!(logs_contain("Skipping non-primary order"));
+}
 
     #[tokio::test]
     #[traced_test]
