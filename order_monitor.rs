@@ -457,6 +457,14 @@ where
         }
 
         for (_, order) in self.prove_cache.iter() {
+             if order.fulfillment_type != FulfillmentType::LockAndFulfill {
+        tracing::debug!(
+            "Skipping non-primary order (type: {:?}) with ID: {}",
+            order.fulfillment_type,
+            order.id()
+        );
+        continue;
+    }
             let is_fulfilled = self
                 .db
                 .is_request_fulfilled(U256::from(order.request.id))
@@ -477,6 +485,14 @@ where
         }
 
         for (_, order) in self.lock_and_prove_cache.iter() {
+            if order.fulfillment_type != FulfillmentType::LockAndFulfill {
+        tracing::debug!(
+            "Skipping non-primary order (type: {:?}) with ID: {}",
+            order.fulfillment_type,
+            order.id()
+        );
+        continue;
+    }
             let is_lock_expired = order.request.lock_expires_at() < current_block_timestamp;
             if is_lock_expired {
                 tracing::debug!("Request {:x} was scheduled to be locked by us, but its lock has now expired. Skipping.", order.request.id);
@@ -623,8 +639,13 @@ where
         config: &OrderMonitorConfig,
         prev_orders_by_status: &mut String,
     ) -> Result<Vec<Arc<OrderRequest>>> {
-        let num_orders = orders.len();
-        // Get our current capacity for proving orders given our config and the number of orders that are currently committed to be proven + fulfilled.
+        let primary_orders: Vec<Arc<OrderRequest>> = orders
+        .into_iter()
+        .filter(|order| order.fulfillment_type == FulfillmentType::LockAndFulfill)
+        .collect();
+
+    let num_orders = primary_orders.len();
+            // Get our current capacity for proving orders
         let capacity = self
             .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
             .await?;
@@ -722,7 +743,7 @@ where
             // For each order in consideration, check if it can be completed before its expiration
             // and that there is enough gas to pay for the lock and fulfillment of all orders
             // including the committed orders.
-            for order in orders {
+            for order in primary_orders {
                 if final_orders.len() >= capacity_granted {
                     break;
                 }
@@ -783,7 +804,7 @@ where
             }
         } else {
             // If no peak khz limit, just check gas for each order
-            for order in orders {
+            for order in primary_orders {
                 if final_orders.len() >= capacity_granted {
                     break;
                 }
@@ -1363,7 +1384,7 @@ pub(crate) mod tests {
 
         // All orders should be processed since capacity is unlimited
         let mut processed_count = 0;
-        for order in orders {
+        for order in primary_orders {
             if let Some(order) = ctx.db.get_order(&order.id()).await.unwrap() {
                 processed_count += 1;
                 assert_eq!(order.status, OrderStatus::PendingProving);
